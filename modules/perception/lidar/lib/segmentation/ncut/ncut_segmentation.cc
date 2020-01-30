@@ -62,9 +62,9 @@ bool NCutSegmentation::Init(const SegmentationInitOptions& options) {
     return false;
   }
   int num_threads = 1;
-  /*#pragma omp parallel
-    { num_threads = omp_get_num_threads(); }
-  */
+#pragma omp parallel
+  { num_threads = omp_get_num_threads(); }
+
   AINFO << "number threads " << num_threads;
   _segmentors.resize(num_threads);
   for (int i = 0; i < num_threads; ++i) {
@@ -142,6 +142,8 @@ bool NCutSegmentation::Configure(std::string param_file) {
   ground_detector_str_ = seg_param_.ground_detector();
   roi_filter_str_ = seg_param_.roi_filter();
   ncut_param_ = seg_param_.ncut_param();
+  do_classification_ = seg_param_.do_classification();
+  AINFO << "NCut Segmentation " << seg_param_.DebugString();
   return true;
 }
 
@@ -198,12 +200,11 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
   std::vector<base::ObjectPtr>* segments = &(frame->segmented_objects);
   double start_t = omp_get_wtime();
   int num_threads = 1;
-  /*#pragma omp parallel
-    { num_threads = omp_get_num_threads(); }
-  */
+#pragma omp parallel
+  { num_threads = omp_get_num_threads(); }
 
-#ifdef DEBUG_NCUT
   AINFO << "input point cloud: " << original_cloud_->size() << " points";
+#ifdef DEBUG_NCUT
   VisualizePointCloud(original_cloud_);
 #endif
 
@@ -218,13 +219,17 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
     AINFO << "remove ground";
     cloud_above_ground->CopyPointCloud(*lidar_frame_ref_->cloud,
                                        lidar_frame_ref_->non_ground_indices);
+  } else {
+    // if used as secondary segmentor, got from cloud directly
+    cloud_above_ground->CopyPointCloud(*lidar_frame_ref_->cloud,
+                                       lidar_frame_ref_->secondary_indices);
   }
 
-  // filter_by_ground(cloud, non_ground_indices, &cloud_above_ground);
-  ADEBUG << "filter ground, elapsed time: " << omp_get_wtime() - start_t;
-  start_t = omp_get_wtime();
 #ifdef DEBUG_NCUT
-  AINFO << "filter ground: " << cloud_above_ground->size() << " points left";
+  // filter_by_ground(cloud, non_ground_indices, &cloud_above_ground);
+  AINFO << "filter ground, elapsed time: " << omp_get_wtime() - start_t
+        << cloud_above_ground->size() << " points left";
+  start_t = omp_get_wtime();
   VisualizePointCloud(cloud_above_ground);
 #endif
 
@@ -232,11 +237,11 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
   base::PointFCloudPtr cloud_after_car_filter;
   ObstacleFilter(cloud_above_ground, vehicle_filter_cell_size_, false,
                  &cloud_after_car_filter, segments);
-  ADEBUG << "filter vehicle, elapsed time: " << omp_get_wtime() - start_t;
-  start_t = omp_get_wtime();
 #ifdef DEBUG_NCUT
-  AINFO << "filter vehicle: " << cloud_after_car_filter->size()
+  AINFO << "filter vehicle, elapsed time: " << omp_get_wtime() - start_t
+        << "filter vehicle: " << cloud_after_car_filter->size()
         << " points left";
+  start_t = omp_get_wtime();
   VisualizePointCloud(cloud_after_car_filter);
 #endif
 
@@ -245,29 +250,26 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
   ObstacleFilter(cloud_after_car_filter, pedestrian_filter_cell_size_, true,
                  &cloud_after_people_filter, segments);
 
-  ADEBUG << "filter pedestrian, elapsed time: " << omp_get_wtime() - start_t;
-  start_t = omp_get_wtime();
 #ifdef DEBUG_NCUT
+  AINFO << "filter pedestrian, elapsed time: " << omp_get_wtime() - start_t;
+  start_t = omp_get_wtime();
   AINFO << "filter pedestrian: " << cloud_after_people_filter->size()
         << " points left";
   VisualizePointCloud(cloud_after_people_filter);
-  ADEBUG << "after filter car/pedestrian #segments " << segments->size();
-  VisualizeSegments(*segments);
+  AINFO << "after filter car/pedestrian #segments " << segments->size();
+// VisualizeSegments(*segments);
 #endif
 
   // .5 partition into small regions
   std::vector<base::PointFCloudPtr> cloud_components;
   PartitionConnectedComponents(cloud_after_people_filter, partition_cell_size_,
                                &cloud_components);
-  ADEBUG << "partition small regions, elapsed time: "
-         << omp_get_wtime() - start_t;
-  start_t = omp_get_wtime();
 
 #ifdef DEBUG_NCUT
-  // ADEBUG << "partition " << cloud_components.size() << " components";
-  for (size_t i = 0; i < cloud_components.size(); ++i) {
-    VisualizePointCloud(cloud_components[i]);
-  }
+  AINFO << "partition small regions, elapsed time: "
+        << omp_get_wtime() - start_t;
+  start_t = omp_get_wtime();
+  AINFO << "partition " << cloud_components.size() << " components";
 #endif
 
   std::vector<bool> cloud_outlier_flag(cloud_components.size());
@@ -297,9 +299,10 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
     obj->lidar_supplement.cloud = *pc;
     _outliers->push_back(obj);
   }
-  ADEBUG << "filter outlier, elapsed time: " << omp_get_wtime() - start_t;
+#ifdef DEBUG_NCUT
+  AINFO << "filter outlier, elapsed time: " << omp_get_wtime() - start_t;
   start_t = omp_get_wtime();
-
+#endif
   // .6 graph cut each
   std::vector<std::vector<base::PointFCloudPtr>> threads_segment_pcs(
       num_threads);
@@ -316,9 +319,11 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
     std::vector<std::string>& my_segment_labels = threads_segment_labels[tid];
     std::vector<base::PointFCloudPtr>& my_outlier_pcs =
         threads_outlier_pcs[tid];
+
 #pragma omp for schedule(guided)
     for (size_t i = 0; i < cloud_tbd.size(); ++i) {
       my_ncut->Segment(cloud_components[cloud_tbd[i]]);
+      ADEBUG << "after segment with num segments" << my_ncut->NumSegments();
       for (int j = 0; j < my_ncut->NumSegments(); ++j) {
         base::PointFCloudPtr pc = my_ncut->GetSegmentPointCloud(j);
         std::string label = my_ncut->GetSegmentLabel(j);
@@ -331,10 +336,11 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
       }
     }
   }
-
+#ifdef DEBUG_NCUT
   ADEBUG << "parallel normalized cut, elapsed time: "
          << omp_get_wtime() - start_t;
   start_t = omp_get_wtime();
+#endif
   // .6.2 aggregate results
   std::vector<int> segment_offset(num_threads,
                                   static_cast<int>(segments->size()));
@@ -353,6 +359,10 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
       base::ObjectPtr& obj_ptr = (*segments)[offset + j];
       obj_ptr.reset(new base::Object());
       obj_ptr->lidar_supplement.cloud = *threads_segment_pcs[i][j];
+
+      if (do_classification_) {
+        obj_ptr->type = Label2Type(threads_segment_labels[i][j]);
+      }
     }
   }
   std::vector<int> outlier_offset(num_threads,
@@ -374,15 +384,32 @@ bool NCutSegmentation::Segment(const SegmentationOptions& options,
       obj_ptr->lidar_supplement.cloud = *threads_outlier_pcs[i][j];
     }
   }
-  ADEBUG << "aggregate results, elapsed time: " << omp_get_wtime() - start_t;
+  AINFO << "aggregate results, elapsed time: " << omp_get_wtime() - start_t;
+  AINFO << "final #segments " << segments->size();
+  AINFO << "final #outliers " << _outliers->size();
 
 #ifdef DEBUG_NCUT
-  AINFO << "final #segments " << segments->size();
   VisualizeSegments(*segments);
-  AINFO << "final #outliers " << _outliers->size();
   VisualizeSegments(*_outliers);
 #endif
+
   return true;
+}
+
+base::ObjectType NCutSegmentation::Label2Type(const std::string& label) {
+  if (label == "unknown") {
+    return base::ObjectType::UNKNOWN;
+  }
+  if (label == "nonMot") {
+    return base::ObjectType::BICYCLE;
+  }
+  if (label == "pedestrian") {
+    return base::ObjectType::PEDESTRIAN;
+  }
+  if (label == "smallMot") {
+    return base::ObjectType::VEHICLE;
+  }
+  return base::ObjectType::UNKNOWN;
 }
 
 void NCutSegmentation::PartitionConnectedComponents(
@@ -412,7 +439,7 @@ void NCutSegmentation::ObstacleFilter(const base::PointFCloudPtr& in_cloud,
 
 #ifdef DEBUG_NCUT
   AINFO << "flood fill: " << component_points.size() << " components";
-  VisualizeComponents(in_cloud, component_points);
+// VisualizeComponents(in_cloud, component_points);
 #endif
 
   const unsigned int min_num_points = 50;
@@ -425,17 +452,17 @@ void NCutSegmentation::ObstacleFilter(const base::PointFCloudPtr& in_cloud,
           new base::PointFCloud(*in_cloud, component_points[i]));
       std::string label =
           _segmentors[tid]->GetPcRoughLabel(pc, filter_pedestrian_only);
-      ADEBUG << "before: component id: " << i << ", label: " << label;
+      AINFO << "before: component id: " << i << ", label: " << label;
       if (filter_pedestrian_only) {
         label =
             (label == "pedestrian" || label == "nonMot") ? label : "unknown";
       }
-      ADEBUG << "after: component id: " << i << ", label: " << label;
+      AINFO << "after: component id: " << i << ", label: " << label;
       component_labels[i] = label;
     }
   }  // end of for
 
-  ADEBUG << "classification done";
+  AINFO << "classification done";
   std::vector<int> remaining_pids;
   std::vector<int> obstacle_components;
   for (int i = 0; i < num_components; ++i) {
@@ -446,9 +473,9 @@ void NCutSegmentation::ObstacleFilter(const base::PointFCloudPtr& in_cloud,
                             component_points[i].end());
     }
   }
-  ADEBUG << "obstacle_filter: filter unknown out, obstacle_components.size = "
-         << obstacle_components.size()
-         << ", remaining_pids.size = " << remaining_pids.size();
+  AINFO << "obstacle_filter: filter unknown out, obstacle_components.size = "
+        << obstacle_components.size()
+        << ", remaining_pids.size = " << remaining_pids.size();
   int offset = static_cast<int>(segments->size());
   segments->resize(offset + obstacle_components.size());
   for (size_t i = 0; i < obstacle_components.size(); ++i) {
@@ -593,8 +620,8 @@ void NCutSegmentation::VisualizeComponents(
   for (size_t i = 0; i < component_points.size(); ++i) {
     char text[256];
     char text_id[256];
-    snprintf(text, sizeof(text), "%lu", i);
-    snprintf(text_id, sizeof(text_id), "c%lu", i);
+    snprintf(text, sizeof(text), "%zu", i);
+    snprintf(text_id, sizeof(text_id), "c%zu", i);
     _viewer->addText3D(text, centers[i], 0.3, 1.0, 1.0, 1.0, text_id, 0);
   }
   _viewer->spin();

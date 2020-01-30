@@ -16,6 +16,7 @@
 #include "modules/routing/core/result_generator.h"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_set>
 
 #include "cyber/common/log.h"
@@ -27,7 +28,7 @@ namespace routing {
 using apollo::common::util::ContainsKey;
 
 bool IsCloseEnough(double value_1, double value_2) {
-  constexpr double kEpsilon = 1e-6;
+  static constexpr double kEpsilon = 1e-6;
   return std::fabs(value_1 - value_2) < kEpsilon;
 }
 
